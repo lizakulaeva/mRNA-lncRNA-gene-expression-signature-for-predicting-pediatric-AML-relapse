@@ -1,0 +1,541 @@
+# Prepare TARGET-AML data
+library(devtools)
+devtools::install_github("BioinformaticsFMRP/TCGAbiolinks")
+devtools::install_github(repo ="BioinformaticsFMRP/TCGAbiolinks")
+library(TCGAbiolinks)
+query_target <- GDCquery(project = "TARGET-AML",
+                         data.category = "Transcriptome Profiling",
+                         data.type = "Gene Expression Quantification",
+                         workflow.type = "STAR - Counts")
+samplesDown_Target <- getResults(query_target, cols = c("cases"))
+
+#Get IDs for primary and reccurent tumors
+
+TRBM_Target <- TCGAquery_SampleTypes(barcode = samplesDown_Target,
+                                     typesample = "TRBM")
+TBM_Target <- TCGAquery_SampleTypes(barcode = samplesDown_Target,
+                                    typesample = "TBM")
+#Get expression data for relapsed samples
+query_target <- GDCquery(project = "TARGET-AML",
+                           data.category = "Transcriptome Profiling",
+                           data.type = "Gene Expression Quantification",
+                           workflow.type = "STAR - Counts",
+                           barcode=c(TRBM_Target))
+data <- GDCdownload(query_target)
+data <- GDCprepare(query_target)
+data <- data[,!is.na(data$sample_type)]
+trbm<-as.data.frame(cbind(data$barcode, data$patient))
+colnames(trbm)<-c("sample","TARGET USI")
+
+# Download clinical data from TARGET-AML (https://ocg.cancer.gov/programs/target/data-matrix Clinical File)
+
+library(readxl)
+TARGET_AML_ClinicalData_Discovery_20211201 <- read_excel("~/TARGET_AML_ClinicalData_Discovery_20211201.xlsx")
+head(TARGET_AML_ClinicalData_Discovery_20211201)
+clin_data_T<-TARGET_AML_ClinicalData_Discovery_20211201
+clin_TRBM<-as.data.frame(merge(clin_data_T, trbm, by = "TARGET USI"))
+TRBM_s<-clin_TRBM$sample[clin_TRBM$`First Event`=="Relapse"]
+#Get IDs for primary (without relapse and future relapse) and reccurent tumors
+
+query_target <- GDCquery(project = "TARGET-AML",
+                           data.category = "Transcriptome Profiling",
+                           data.type = "Gene Expression Quantification",
+                           workflow.type = "STAR - Counts",
+                           barcode=c(TBM_Target))
+data <- GDCprepare(query_target)
+data <- data[,!is.na(data$sample_type)]
+tbm<-as.data.frame(cbind(data$barcode, data$patient))
+colnames(tbm)<-c("sample","TARGET USI")
+clin_TBM<-as.data.frame(merge(clin_data_T, tbm, by = "TARGET USI"))
+TBM_r<-clin_TBM$sample[clin_TBM$`First Event`=="Relapse"]
+TBM_nr<-clin_TBM$sample[clin_TBM$`First Event`=="Censored"]
+
+#Get annotation file from Biomart download
+
+annotation_file <- read.delim("~/annotation_file.txt")
+annot<-annotation_file
+colnames(annot)[1]<-"gene"
+annot_miRNA<-subset(annot, annot$Gene.type=="miRNA")
+annot_miRNA<-as.data.frame(annot_miRNA[,1])
+colnames(annot_miRNA)<-"gene"
+annot_lncRNA<-subset(annot, annot$Gene.type=="lncRNA")
+annot_lncRNA<-as.data.frame(annot_lncRNA[,1])
+colnames(annot_lncRNA)<-"gene"
+annot_mRNA<-subset(annot, annot$Gene.type=="protein_coding")
+annot_mRNA<-as.data.frame(annot_mRNA[,1])
+colnames(annot_mRNA)<-"gene"
+
+#Differential expression analysis
+
+query_primary <- GDCquery(project = "TARGET-AML",
+                           data.category = "Transcriptome Profiling",
+                           data.type = "Gene Expression Quantification",
+                           workflow.type = "STAR - Counts",
+                           barcode=c(TBM_nr, TBM_r))
+data_primary <- GDCprepare(query_primary)
+data_primary <- data_primary[,!is.na(data_primary$sample_type)]
+coldata<-as.data.frame(TBM_nr)
+coldata$type<-"non-relapse"
+colnames(coldata)[1]<-"sample"
+coldata2<-as.data.frame(TBM_r)
+coldata2$type<-"relapse"
+colnames(coldata2)[1]<-"sample"
+coldata<-as.data.frame(rbind(coldata, coldata2))
+library(DESeq2)
+dds_primary <- DESeqDataSetFromMatrix(countData = assay(data_primary),
+                              colData = coldata,
+                              design = ~ type)
+keep <- rowSums(counts(dds_primary)) >= 10
+dds_primary <- dds_primary[keep,]
+dds_primary<-DESeq(dds_primary)
+dds_primary$type <- relevel(dds_primary$type, ref = "non-relapse")
+rn<-resultsNames(dds_primary)
+library(apeglm)
+res <- lfcShrink(dds_primary, coef=rn[2], type="apeglm")
+results_primary<-as.data.frame(res)
+results_primary$gene<-rownames(results_primary)
+
+
+res_mirna<-as.data.frame(unique(merge(annot_miRNA, results_primary, by = "gene")))
+res_lncrna<-as.data.frame(unique(merge(annot_lncRNA, results_primary, by = "gene")))
+res_mrna<-as.data.frame(unique(merge(annot_mRNA, results_primary, by = "gene")))
+
+mrna_pr_f<-as.data.frame(subset(res_mrna, (abs(res_mrna$log2FoldChange)>1 & res_mrna$padj<0.05)))
+lncrna_pr_f<-as.data.frame(subset(res_lncrna, (abs(res_lncrna$log2FoldChange)>1 & res_lncrna$padj<0.05)))
+mirna_pr_f<-as.data.frame(subset(res_mirna, (abs(res_mirna$log2FoldChange)>1 & res_mirna$padj<0.05)))
+
+
+query_pr_rel <- GDCquery(project = "TARGET-AML",
+                           data.category = "Transcriptome Profiling",
+                           data.type = "Gene Expression Quantification",
+                           workflow.type = "STAR - Counts",
+                           barcode=c(TBM_nr, TRBM_s))
+
+data_pr_rel<- GDCprepare(query_pr_rel)
+data_pr_rel <- data_pr_rel[,!is.na(data_pr_rel$sample_type)]
+dds_pr_rel<- DESeqDataSet(data_pr_rel, design = ~sample_type)
+keep <- rowSums(counts(dds_pr_rel)) >= 10
+dds_pr_rel <- dds_pr_rel[keep,]
+dds_pr_rel$sample_type <- relevel(dds_pr_rel$sample_type, ref = "Primary Blood Derived Cancer - Bone Marrow")
+dds_pr_rel<-DESeq(dds_pr_rel)
+rn<-resultsNames(dds_pr_rel)
+res <- lfcShrink(dds_pr_rel, coef=rn[2], type="apeglm")
+results_pr_rel<-as.data.frame(res)
+results_pr_rel$gene<-rownames(results_pr_rel)
+
+res_mirna2<-as.data.frame(unique(merge(annot_miRNA, results_pr_rel, by = "gene")))
+res_lncrna2<-as.data.frame(unique(merge(annot_lncRNA, results_pr_rel, by = "gene")))
+res_mrna2<-as.data.frame(unique(merge(annot_mRNA, results_pr_rel, by = "gene")))
+
+
+mrna_rel_f<-as.data.frame(subset(res_mrna2, (abs(res_mrna2$log2FoldChange)>1 & res_mrna2$padj<0.05)))
+lncrna_rel_f<-as.data.frame(subset(res_lncrna2, (abs(res_lncrna2$log2FoldChange)>1 & res_lncrna2$padj<0.05)))
+mirna_rel_f<-as.data.frame(subset(res_mirna2, (abs(res_mirna2$log2FoldChange)>1 & res_mirna2$padj<0.05)))
+
+#volcano plots
+library(EnhancedVolcano)
+p1<-EnhancedVolcano(res_mrna,
+                lab = res_mrna$gene,
+                x = 'log2FoldChange',
+                y = 'padj',
+                FCcutoff = 2,
+                pCutoff = 0.05,
+                title = "non-relapse vs future relapse",
+                legendLabels = c("NS", expression(Log[2] ~ FC), "padj", expression(padj ~ and
+                                                                                   ~ log[2] ~ FC))
+)
+p2<-EnhancedVolcano(res_mrna2,
+                lab = res_mrna2$gene,
+                x = 'log2FoldChange',
+                y = 'padj',
+                FCcutoff = 2,
+                pCutoff = 0.05,
+                title = "non-relapse vs after relapse",
+                legendLabels = c("NS", expression(Log[2] ~ FC), "padj", expression(padj ~ and
+                                                                                   ~ log[2] ~ FC))
+)
+library(gridExtra)
+library(grid)
+mrna_plot<-grid.arrange(p1, p2,
+             ncol=2,
+             top = textGrob('mRNA volcano',
+                            just = c('center'),
+                            gp = gpar(fontsize = 32)))
+l1<-EnhancedVolcano(res_lncrna,
+                    lab = res_lncrna$gene,
+                    x = 'log2FoldChange',
+                    y = 'padj',
+                    FCcutoff = 2,
+                    pCutoff = 0.05,
+                    title = "non-relapse vs future relapse",
+                    legendLabels = c("NS", expression(Log[2] ~ FC), "padj", expression(padj ~ and
+                                                                                       ~ log[2] ~ FC))
+)
+l2<-EnhancedVolcano(res_lncrna2,
+                    lab = res_lncrna2$gene,
+                    x = 'log2FoldChange',
+                    y = 'padj',
+                    FCcutoff = 2,
+                    pCutoff = 0.05,
+                    title = "non-relapse vs after relapse",
+                    legendLabels = c("NS", expression(Log[2] ~ FC), "padj", expression(padj ~ and
+                                                                                       ~ log[2] ~ FC))
+)
+grid.arrange(l1, l2,
+             ncol=2,
+             top = textGrob('lncRNA volcano',
+                            just = c('center'),
+                            gp = gpar(fontsize = 32)))
+m1<-EnhancedVolcano(res_mirna,
+                    lab = res_mirna$gene,
+                    x = 'log2FoldChange',
+                    y = 'padj',
+                    FCcutoff = 2,
+                    pCutoff = 0.05,
+                    title = "non-relapse vs future relapse",
+                    legendLabels = c("NS", expression(Log[2] ~ FC), "padj", expression(padj ~ and
+                                                                                       ~ log[2] ~ FC))
+)
+m2<-EnhancedVolcano(res_mirna2,
+                    lab = res_mirna2$gene,
+                    x = 'log2FoldChange',
+                    y = 'padj',
+                    FCcutoff = 2,
+                    pCutoff = 0.05,
+                    title = "non-relapse vs after relapse",
+                    legendLabels = c("NS", expression(Log[2] ~ FC), "padj", expression(padj ~ and
+                                                                                       ~ log[2] ~ FC))
+)
+grid.arrange(m1, m2,
+             ncol=2,
+             top = textGrob('miRNA volcano',
+                            just = c('center'),
+                            gp = gpar(fontsize = 32)))
+
+#find common DE genes
+
+mrnas<-as.data.frame(intersect(mrna_pr_f$gene, mrna_rel_f$gene))
+colnames(mrnas)<-"gene"
+lncrnas<-as.data.frame(intersect(lncrna_pr_f$gene, lncrna_rel_f$gene))
+colnames(lncrnas)<-"gene"
+
+library(ggvenn)
+library(RColorBrewer)
+myCol<-c("#B3E2CD", "#FDCDAC")
+list_mrna <- list(`non-relapse vs future relapse` = c(mrna_pr_f$gene),
+                  `non-relapse vs after relapse` = c(mrna_rel_f$gene))
+list_lncrna <- list(`non-relapse vs future relapse` = c(lncrna_pr_f$gene),
+          `non-relapse vs after relapse` = c(lncrna_rel_f$gene))
+ggvenn(
+  list_mrna, 
+  fill_color = c("#B3E2CD", "#FDCDAC"),
+  stroke_size = 0.5, set_name_size = 4,
+)
+ggvenn(
+  list_lncrna, 
+  fill_color = c("#B3E2CD", "#FDCDAC"),
+  stroke_size = 0.5, set_name_size = 4,
+)
+#Event-free survival (EFS) analysis for mRNAs
+
+clin<-as.data.frame(cbind(clin_TBM$`TARGET USI`, clin_TBM$`First Event`, clin_TBM$`Event Free Survival Time in Days`))
+vsd<-as.data.frame(assay(vst(dds_primary)))
+vsd$gene<-rownames(vsd)
+mrnas<-as.data.frame(mrnas)
+colnames(mrnas)<-"gene"
+mrnas_vsd<-as.data.frame(merge(vsd, mrnas, by = "gene"))
+rownames(mrnas_vsd)<-mrnas_vsd$gene
+mrnas_vsd<-mrnas_vsd[,-1]
+mrnas_vsd<-as.data.frame(t(mrnas_vsd))
+for (i in (1:41)){
+  mrnas_vsd[,i]<-ifelse(mrnas_vsd[,i]>median(mrnas_vsd[,i]), "HIGH", "LOW")
+}
+mrnas_vsd$sample<-rownames(mrnas_vsd)
+colnames(clin)<-c("sample", "event", "time") 
+mrnas_time<-as.data.frame(merge(clin_TBM, mrnas_vsd, by = "sample"))
+library(survival)
+mrnas_time<-as.data.frame(cbind(mrnas_time[,1], mrnas_time[,7], mrnas_time[,8], mrnas_time[,(67:107)]))
+colnames(mrnas_time)[3]<-"time"
+colnames(mrnas_time)[2]<-"status"
+colnames(mrnas_time)[1]<-"sample"
+mrnas_time[,2]<-ifelse(mrnas_time[,2]=="Relapse", 1, 0)
+mrnas_time$time<-as.numeric(mrnas_time$time)
+mrnas_time$status<-as.numeric(mrnas_time$status)
+library(survivalAnalysis)
+covariate_names<-c(
+  'ENSG00000007866.22'="ENSG00000007866.22",
+  'ENSG00000010379.16'="ENSG00000010379.16",
+  'ENSG00000049130.16'="ENSG00000049130.16",
+  'ENSG00000050327.15'="ENSG00000050327.15",
+  'ENSG00000075213.11'="ENSG00000075213.11",
+  'ENSG00000088881.21'="ENSG00000088881.21",
+  'ENSG00000101115.13'="ENSG00000101115.13",
+  'ENSG00000101134.12'="ENSG00000101134.12",
+  'ENSG00000101938.15'="ENSG00000101938.15",
+  'ENSG00000104888.10'="ENSG00000104888.10",
+  'ENSG00000105223.20'="ENSG00000105223.20",
+  'ENSG00000120833.14'="ENSG00000120833.14",
+  'ENSG00000122641.11'="ENSG00000122641.11",
+  'ENSG00000123095.6'="ENSG00000123095.6",
+  'ENSG00000127074.15'="ENSG00000127074.15",
+  'ENSG00000127533.4'="ENSG00000127533.4",
+  'ENSG00000130635.16'="ENSG00000130635.16",
+  'ENSG00000134762.17'="ENSG00000134762.17",
+  'ENSG00000142611.17'="ENSG00000142611.17",
+  'ENSG00000145911.6'="ENSG00000145911.6",
+  'ENSG00000149289.11'="ENSG00000149289.11",
+  'ENSG00000154734.16'="ENSG00000154734.16",
+  'ENSG00000160191.18'="ENSG00000160191.18",
+  'ENSG00000163888.4'="ENSG00000163888.4",
+  'ENSG00000167105.8'="ENSG00000167105.8",
+  'ENSG00000167889.13'="ENSG00000167889.13",
+  'ENSG00000169224.13'="ENSG00000169224.13",
+  'ENSG00000169427.8'="ENSG00000169427.8",
+  'ENSG00000170153.11'="ENSG00000170153.11",
+  'ENSG00000171016.13'="ENSG00000171016.13",
+  'ENSG00000171435.14'="ENSG00000171435.14",
+  'ENSG00000177508.12'="ENSG00000177508.12",
+  'ENSG00000178531.6'="ENSG00000178531.6",
+  'ENSG00000183166.11'="ENSG00000183166.11",
+  'ENSG00000184451.5'="ENSG00000184451.5",
+  'ENSG00000185585.20'="ENSG00000185585.20",
+  'ENSG00000197249.14'="ENSG00000197249.14",
+  'ENSG00000197992.7'="ENSG00000197992.7",
+  'ENSG00000239887.6'="ENSG00000239887.6",
+  'ENSG00000250722.6'="ENSG00000250722.6",
+  'ENSG00000271503.6'="ENSG00000271503.6"
+)
+
+mrnas_efs<-analyze_multivariate(
+  mrnas_time,
+  vars(time,status),
+  covariates = vars('ENSG00000007866.22',
+                    'ENSG00000010379.16',
+                    'ENSG00000049130.16',
+                    'ENSG00000050327.15',
+                    'ENSG00000075213.11',
+                    'ENSG00000088881.21',
+                    'ENSG00000101115.13',
+                    'ENSG00000101134.12',
+                    'ENSG00000101938.15',
+                    'ENSG00000104888.10',
+                    'ENSG00000105223.20',
+                    'ENSG00000120833.14',
+                    'ENSG00000122641.11',
+                    'ENSG00000123095.6',
+                    'ENSG00000127074.15',
+                    'ENSG00000127533.4',
+                    'ENSG00000130635.16',
+                    'ENSG00000134762.17',
+                    'ENSG00000142611.17',
+                    'ENSG00000145911.6',
+                    'ENSG00000149289.11',
+                    'ENSG00000154734.16',
+                    'ENSG00000160191.18',
+                    'ENSG00000163888.4',
+                    'ENSG00000167105.8',
+                    'ENSG00000167889.13',
+                    'ENSG00000169224.13',
+                    'ENSG00000169427.8',
+                    'ENSG00000170153.11',
+                    'ENSG00000171016.13',
+                    'ENSG00000171435.14',
+                    'ENSG00000177508.12',
+                    'ENSG00000178531.6',
+                    'ENSG00000183166.11',
+                    'ENSG00000184451.5',
+                    'ENSG00000185585.20',
+                    'ENSG00000197249.14',
+                    'ENSG00000197992.7',
+                    'ENSG00000239887.6',
+                    'ENSG00000250722.6',
+                    'ENSG00000271503.6')
+)
+forest_plot(mrnas_efs, orderer = ~order(endpoint, HR))
+#p-value cutoff = 0.0012
+#transcripts ENSG00000149289.11 (ZC3H12C gene) and ENSG00000075213.11 (SEMA3A gene)
+
+fit_mrna1 <- survfit(Surv(time, status) ~ ENSG00000149289.11, data = mrnas_time)
+ggsurv_mrna <- ggsurvplot(
+  fit_mrna1,                     
+  data = mrnas_time,             
+  risk.table = TRUE,
+  title = c("ZC3H12C, event-free survival"),
+  pval = TRUE,             
+  conf.int = TRUE,         
+  palette = c("#F94C66", "#53BF9D"),
+  xlim = c(0,3600),        
+  # survival estimates.
+  xlab = "Time in days",
+  break.time.by = 500,     
+  ggtheme = theme_light(), 
+  risk.table.y.text.col = T,
+  risk.table.height = 0.25, 
+  risk.table.y.text = FALSE,
+  # in legend of risk table.
+  ncensor.plot = TRUE,      
+  ncensor.plot.height = 0.25,
+  conf.int.style = "step",  
+  legend.labs =
+    c("High", "Low")    
+)
+ggsurv_mrna
+
+fit_mrna2 <- survfit(Surv(time, status) ~ ENSG00000075213.11, data = mrnas_time)
+ggsurv_mrna2 <- ggsurvplot(
+  fit_mrna2,                     
+  data = mrnas_time,             
+  risk.table = TRUE,
+  title = c("SEMA3A, event-free survival"),
+  pval = TRUE,             
+  conf.int = TRUE,         
+  palette = c("#F94C66", "#53BF9D"),
+  xlim = c(0,3600),        
+  # survival estimates.
+  xlab = "Time in days",
+  break.time.by = 500,     
+  ggtheme = theme_light(), 
+  risk.table.y.text.col = T,
+  risk.table.height = 0.25, 
+  risk.table.y.text = FALSE,
+  # in legend of risk table.
+  ncensor.plot = TRUE,      
+  ncensor.plot.height = 0.25,
+  conf.int.style = "step",  
+  legend.labs =
+    c("High", "Low")    
+)
+ggsurv_mrna2
+
+
+lncrnas<-as.data.frame(lncrnas)
+colnames(lncrnas)<-"gene"
+lncrnas_vsd<-as.data.frame(merge(vsd, lncrnas, by = "gene"))
+rownames(lncrnas_vsd)<-lncrnas_vsd$gene
+lncrnas_vsd<-lncrnas_vsd[,-1]
+lncrnas_vsd<-as.data.frame(t(lncrnas_vsd))
+for (i in (1:7)){
+  lncrnas_vsd[,i]<-ifelse(lncrnas_vsd[,i]>median(lncrnas_vsd[,i]), "HIGH", "LOW")
+}
+lncrnas_vsd$sample<-rownames(lncrnas_vsd)
+colnames(clin)<-c("sample", "event", "time") 
+lncrnas_time<-as.data.frame(merge(clin_TBM, lncrnas_vsd, by = "sample"))
+lncrnas_time<-as.data.frame(cbind(lncrnas_time[,1], lncrnas_time[,7], lncrnas_time[,8], lncrnas_time[,(67:73)]))
+colnames(lncrnas_time)[3]<-"time"
+colnames(lncrnas_time)[2]<-"status"
+colnames(lncrnas_time)[1]<-"sample"
+lncrnas_time[,2]<-ifelse(lncrnas_time[,2]=="Relapse", 1, 0)
+lncrnas_time$time<-as.numeric(lncrnas_time$time)
+lncrnas_time$status<-as.numeric(lncrnas_time$status)
+covariate_names<-c(
+  'ENSG00000226954.1'="ENSG00000226954.1",
+  'ENSG00000230266.1'="ENSG00000230266.1",
+  'ENSG00000261838.5'="ENSG00000261838.5",
+  'ENSG00000274213.1'="ENSG00000274213.1",
+  'ENSG00000274383.1'="ENSG00000274383.1",
+  'ENSG00000287569.1'="ENSG00000287569.1",
+  'ENSG00000287823.1'="ENSG00000287823.1"
+)
+lncrnas_efs<-analyze_multivariate(
+  lncrnas_time,
+  vars(time,status),
+  covariates = vars('ENSG00000226954.1',
+                    'ENSG00000230266.1',
+                    'ENSG00000261838.5',
+                    'ENSG00000274213.1',
+                    'ENSG00000274383.1',
+                    'ENSG00000287569.1',
+                    'ENSG00000287823.1')
+)
+forest_plot(lncrnas_efs, orderer = ~order(endpoint, HR))
+#p-value cutoff = 0.007
+#transcript ENSG00000287569.1 (novel)
+
+
+fit_lncrna <- survfit(Surv(time, status) ~ ENSG00000287569.1, data = lncrnas_time)
+ggsurv_lncrna <- ggsurvplot(
+  fit_lncrna,                     
+  data = lncrnas_time,             
+  risk.table = TRUE,
+  title = c("ENSG00000287569.1, event-free survival"),
+  pval = TRUE,             
+  conf.int = TRUE,         
+  palette = c("#F94C66", "#53BF9D"),
+  xlim = c(0,3600),        
+  # survival estimates.
+  xlab = "Time in days",
+  break.time.by = 500,     
+  ggtheme = theme_light(), 
+  risk.table.y.text.col = T,
+  risk.table.height = 0.25, 
+  risk.table.y.text = FALSE,
+  # in legend of risk table.
+  ncensor.plot = TRUE,      
+  ncensor.plot.height = 0.25,
+  conf.int.style = "step",  
+  legend.labs =
+    c("High", "Low")    
+)
+ggsurv_lncrna
+
+# ROC curve
+
+library(pROC)
+mod_SEMA3A<-roc(event~SEMA3A, family=binomial(logit), data=precrec_obj)
+mod_ZC3H12C<-roc(event~ZC3H12C, family=binomial(logit), data=precrec_obj)
+mod_lcnRNA<-roc(event~ENSG00000287569.1, family=binomial(logit), data=precrec_obj)
+mod_mrnas<-glm(event~SEMA3A+ZC3H12C, family=binomial(logit), data=precrec_obj)
+mod_mrnas<-roc(mod_mrnas$y , mod_mrnas$fitted.values,ci=T)
+mod_ZL<-glm(event~ZC3H12C+ZC3H12C, family=binomial(logit), data=precrec_obj)
+mod_ZL<-roc(mod_ZL$y, mod_ZL$fitted.values,ci=T)
+mod_SL<-glm(event~SEMA3A+ENSG00000287569.1, family=binomial(logit), data=precrec_obj)
+mod_SL<-roc(mod_SL$y, mod_SL$fitted.values,ci=T)
+mod_all<-glm(event~ZC3H12C+ENSG00000287569.1+SEMA3A, family=binomial(logit), data=precrec_obj)
+mod_all<-roc(mod_all$y, mod_all$fitted.values,ci=T)
+op <- par(cex = 0.7)
+roc1 <- plot.roc(mod_SEMA3A, main="ROC comparison", percent=TRUE, col="black")
+roc2 <- lines.roc(mod_ZC3H12C, percent=TRUE, col="orange")
+roc3 <- lines.roc(mod_lcnRNA, percent=TRUE, col="skyblue")
+roc4<-lines.roc(mod_mrnas,percent=TRUE, col="darkgreen")
+roc5<-lines.roc(mod_ZL,percent=TRUE, col="yellow")
+roc5<-lines.roc(mod_SL,percent=TRUE, col="blue")
+roc6<-lines.roc(mod_all,percent=TRUE, col="#E34234")
+mod_all$auc
+legend("bottomright", legend=c("SEMA3A, AUC=0.6372", "ZC3H12C, AUC=0.7198", "ENSG00000287569.1, AUC=0.7385", "SEMA3A+ZC3H12C, AUC=0.7515", "ZC3H12C+ENSG00000287569.1, AUC=0.8", "SEMA3A+ENSG00000287569.1, AUC=0.7384", "all markers, AUC=0.8129"), 
+       col=c("black","orange","skyblue","darkgreen","yellow","blue", "#E34234"), lwd=6)
+
+# Linear regression analysis
+
+library(dplyr)
+clin2<-select(clin_TBM, `TARGET USI`, `Event Free Survival Time in Days`, `FLT3/ITD positive?`, `FLT3 PM`, `NPM mutation`, `CEBPA mutation`, `WT1 mutation`, `Risk group`)
+colnames(clin2)[1]<-"sample"
+vsd<-as.data.frame(t(assay(vst(dds_primary))))
+vsd2<-select(vsd, ENSG00000149289.11, ENSG00000075213.11, ENSG00000287569.1)
+colnames(vsd2)<-c("ZC3H12C","SEMA3A","ENSG00000287569.1")
+library(stringr)
+vsd2$sample<-str_sub(rownames(vsd2),1,16)
+data<-as.data.frame(merge(vsd2, clin2, by = "sample"))
+for (i in 1:11){
+  for (j in 1:120){
+    data[j,i]<-ifelse(data[j,i]=="Unknown", NA, data[j,i])
+    data[j,i]<-ifelse(data[j,i]=="Not done", NA, data[j,i])
+    data[j,i]<-ifelse(data[j,i]=="NO", "No", data[j,i])
+    data[j,i]<-ifelse(data[j,i]=="", NA, data[j,i])
+  }
+}
+for (i in (2:4)){
+  for (j in (1:120)){
+    data[j,i]<-ifelse((data[j,i]>median(data[,i])),1,0)
+  }
+}
+data<-data[,-1]
+colnames(data)[5]<-"FLT3-ITD"
+data$`Event Free Survival Time in Days`<-as.numeric(data$`Event Free Survival Time in Days`)
+#SEMA3A
+library(sjPlot)
+library(sjlabelled)
+library(sjmisc)
+library(ggplot2)
+model <- glm(`Event Free Survival Time in Days` ~ SEMA3A + ZC3H12C + ENSG00000287569.1 + `FLT3-ITD` +`FLT3 PM` + `NPM mutation` + `CEBPA mutation` + `WT1 mutation` + `Risk group`, data = data)
+myplot<-plot_model(model, vline.color = "black", show.values = TRUE, value.offset = .3, title = "Event-free survival, linear regression", sort.est = TRUE)
+myplot+ theme_bw()
